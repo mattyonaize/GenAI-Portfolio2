@@ -1,101 +1,205 @@
+import re
 import time
 import pandas as pd
 from playwright.sync_api import sync_playwright
 
-BASE_URL = "https://www.hbo-kennisbank.nl/searchresult?q=&page="
-MAX_PAGES = 5
-BASE_DOMAIN = "https://www.hbo-kennisbank.nl"
+BASE_DOMAIN = "https://hbo-kennisbank.nl"
+
+# 🔍 meerdere zoekthema's voor grotere dataset
+SEARCH_TERMS = [
+    "data",
+    "dashboard",
+    "zorg",
+    "ict",
+    "onderwijs",
+    "ai",
+    "duurzaamheid"
+]
+
+MAX_PAGES_PER_QUERY = 20
+
+all_publication_links = set()
+all_records = []
 
 
-def get_publication_links(page):
-    """Stap 1: pak alle detail links uit de lijstpagina"""
-    links = []
+def extract_publication_links(page):
+    """
+    Pak ALLE unieke detailpagina links
+    """
 
-    items = page.query_selector_all("a")  # we filteren zelf
+    links = set()
 
-    for item in items:
-        href = item.get_attribute("href")
+    anchors = page.query_selector_all("a")
 
-        # 🔑 Filter alleen publicatie links
-        if href and "/details/" in href:
-            full_url = BASE_DOMAIN + href
-            links.append(full_url)
+    for a in anchors:
+        href = a.get_attribute("href")
 
-    return list(set(links))  # duplicates verwijderen
+        if href:
+
+            # 🔑 detailpagina patroon
+            if "/details/" in href:
+
+                # absolute url maken
+                if href.startswith("/"):
+                    href = BASE_DOMAIN + href
+
+                links.add(href)
+
+    return links
 
 
-def scrape_detail(page, url):
-    """Stap 2: scrape echte detailpagina"""
+def clean_text(text):
+    if not text:
+        return None
+
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def safe_text(page, selector):
+    try:
+        el = page.query_selector(selector)
+
+        if el:
+            return clean_text(el.inner_text())
+
+    except:
+        return None
+
+    return None
+
+
+def scrape_detail_page(page, url):
+
     page.goto(url, timeout=60000)
+
     page.wait_for_timeout(1500)
 
-    def safe(selector):
-        el = page.query_selector(selector)
-        return el.inner_text().strip() if el else None
+    title = safe_text(page, "h1")
 
-    # ⚠️ Deze selectors moet je mogelijk fine-tunen via inspect!
+    # 🔥 robuustere extraction
+    paragraphs = page.query_selector_all("p")
+
+    all_p = []
+
+    for p in paragraphs:
+
+        txt = clean_text(p.inner_text())
+
+        if txt and len(txt) > 80:
+            all_p.append(txt)
+
+    abstract = " ".join(all_p[:3])
+
     data = {
-        "title": safe("h1"),
-        "authors": safe("text=Onderzoeker") or safe("text=Auteur"),
-        "abstract": safe("div:has-text('Samenvatting')") or safe("p"),
-        "year": safe("text=202"),
+        "title": title,
+        "abstract": abstract,
         "url": url
     }
 
     return data
 
 
-def main():
-    all_links = []
-    all_data = []
+with sync_playwright() as p:
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+    browser = p.chromium.launch(
+        headless=True
+    )
 
-        # 🔁 Stap 1: verzamel alle links via paginatie
-        for i in range(1, MAX_PAGES + 1):
-            url = BASE_URL + str(i)
-            print(f"\n📄 Pagina {i}: {url}")
+    page = browser.new_page()
 
-            page.goto(url, timeout=60000)
+    # ==================================================
+    # STAP 1 — ALLE DETAIL LINKS VERZAMELEN
+    # ==================================================
+
+    for term in SEARCH_TERMS:
+
+        print(f"\n🔎 Zoekterm: {term}")
+
+        for page_num in range(1, MAX_PAGES_PER_QUERY + 1):
+
+            search_url = (
+                f"https://hbo-kennisbank.nl/searchresult?"
+                f"q={term}&page={page_num}"
+            )
+
+            print(f"📄 Pagina {page_num}")
+
+            page.goto(search_url, timeout=60000)
+
             page.wait_for_timeout(2000)
 
-            links = get_publication_links(page)
-            print(f"🔗 Gevonden links: {len(links)}")
+            links = extract_publication_links(page)
 
-            all_links.extend(links)
+            before = len(all_publication_links)
 
-        all_links = list(set(all_links))
-        print(f"\n✅ Totaal unieke links: {len(all_links)}")
+            all_publication_links.update(links)
 
-        # 🔍 Stap 2: scrape detailpagina’s
-        for i, link in enumerate(all_links):
-            try:
-                print(f"[{i+1}/{len(all_links)}] Scraping...")
-                data = scrape_detail(page, link)
-                all_data.append(data)
+            after = len(all_publication_links)
 
-                time.sleep(1)  # netjes blijven
+            print(
+                f"Nieuwe links: {after-before} | "
+                f"Totaal: {after}"
+            )
 
-            except Exception as e:
-                print(f"❌ Error bij {link}: {e}")
+            # 🛑 stop als pagina leeg raakt
+            if len(links) == 0:
+                print("Geen nieuwe resultaten meer")
+                break
 
-        browser.close()
+            time.sleep(1)
 
-    # 🧱 DataFrame
-    df = pd.DataFrame(all_data)
+    print("\n==========================")
+    print(f"TOTAAL LINKS: {len(all_publication_links)}")
+    print("==========================")
 
-    # 🧹 Cleaning
-    df = df.drop_duplicates()
-    df = df.dropna(subset=["title"])
+    # ==================================================
+    # STAP 2 — DETAILPAGINA'S SCRAPEN
+    # ==================================================
 
-    # 💾 Opslaan
-    df.to_csv("hbo_kennisbank_full.csv", index=False)
+    for idx, link in enumerate(all_publication_links):
 
-    print("\n🎉 Klaar!")
-    print(df.head())
+        try:
 
+            print(
+                f"[{idx+1}/{len(all_publication_links)}]"
+            )
 
-if __name__ == "__main__":
-    main()
+            record = scrape_detail_page(page, link)
+
+            all_records.append(record)
+
+            time.sleep(0.5)
+
+        except Exception as e:
+
+            print(f"❌ Error: {e}")
+
+    browser.close()
+
+# ==================================================
+# STAP 3 — DATAFRAME
+# ==================================================
+
+df = pd.DataFrame(all_records)
+
+# cleaning
+df = df.drop_duplicates(subset=["url"])
+
+df = df[df["title"].notna()]
+
+df = df[df["abstract"].str.len() > 50]
+
+print("\nDATAFRAME SHAPE:")
+print(df.shape)
+
+# ==================================================
+# OPSLAAN
+# ==================================================
+
+df.to_csv(
+    "hbo_kennisbank_full.csv",
+    index=False
+)
+
+print("\n✅ CSV opgeslagen")
