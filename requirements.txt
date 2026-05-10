@@ -10,3 +10,8 @@ rouge_score
 absl-py
 groq
 openai
+requests
+bs4
+time
+tqdm
+urllib.parse
