@@ -1,0 +1,12 @@
+pandas
+torch
+transformers
+datasets
+evaluate
+scikit-learn
+matplotlib
+nltk
+rouge_score
+absl-py
+groq
+openai
